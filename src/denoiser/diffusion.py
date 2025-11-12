@@ -1224,7 +1224,7 @@ class E2D2(BD3LM):
                     encoder_attention_mask | context_mask[:, None, :]
                 )
             encoder_attention_mask = (
-                encoder_attention_mask[None, ...]
+                encoder_attention_mask
                 & attention_mask[:, None, :]
                 & attention_mask[..., None]
             )[:, None, ...]  # Make attention mask 4D
