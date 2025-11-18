@@ -389,13 +389,16 @@ class MDLM(Denoiser):
         log_p_theta = torch.gather(
             input=model_output, dim=-1, index=denoiser_inputs.x0[..., None]
         ).squeeze(-1)
-        nlls = (
-            log_p_theta
-            * denoiser_inputs.alpha_t_prime
-            / (1 - denoiser_inputs.alpha_t)
-            * denoiser_inputs.tokens_mask
-        )
         block_size = getattr(self.config, "block_size", denoiser_inputs.x0.shape[-1])
+        if block_size == 1:
+            nlls = -(log_p_theta * denoiser_inputs.tokens_mask)
+        else:
+            nlls = (
+                log_p_theta
+                * denoiser_inputs.alpha_t_prime
+                / (1 - denoiser_inputs.alpha_t)
+                * denoiser_inputs.tokens_mask
+            )
         if self.training or block_size == 1:
             batch_nll = -(log_p_theta * denoiser_inputs.tokens_mask).sum(dim=-1)
         else:
