@@ -1,0 +1,4 @@
+gen_loss:
+  _target_: src.tasks.metrics.Loss
+  name: "loss/gen"
+  update_key: gen_loss

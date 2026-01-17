@@ -1,0 +1,25 @@
+#file: noinspection LongLine
+_target_: scripts.eval.mteb_eval.run_mteb
+benchmark: null  # Set via CLI, e.g., task.benchmark="MTEB(eng, v2)"
+tasks: null  # Set via CLI, e.g., task.tasks='[\"STSBenchmark\",\"MRPC\"]'
+eval_splits: null
+eval_subsets: null
+output_folder: ${output_path}
+overwrite_results: false
+verbosity: 2
+encode_kwargs:
+  batch_size: 32
+  pooling: mean
+  normalize_embeddings: false
+model:
+  _target_: scripts.eval.mteb_eval.BD3LMEncoder
+  pretrained_model_name_or_path: ${pretrained_model_name_or_path}
+  pretrained_model_revision: ${pretrained_model_revision}
+  tokenizer: ${tokenizer}
+  pooling: mean
+  max_length: ${max_length}
+  device: null
+  dtype: null
+  prompts: null
+  prompt: null
+  model_config_overrides: null

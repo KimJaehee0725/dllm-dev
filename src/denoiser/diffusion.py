@@ -780,6 +780,54 @@ class BD3LMConfig(MDLMConfig):
         self.bidirectional_ctx_attn = bidirectional_ctx_attn
 
 
+class BD3MInfoNCEConfig(BD3LMConfig):
+    """Configuration class for BD3MInfoNCE models."""
+
+    model_type = "bd3m_infonce"
+    auto_map = {
+        "AutoConfig": "diffusion.BD3MInfoNCEConfig",
+        "AutoModel": "diffusion.BD3MInfoNCE",
+        "AutoModelForMaskedLM": "diffusion.BD3MInfoNCE",
+    }
+
+    def __init__(
+        self,
+        info_nce_temperature: float = 0.07,
+        info_nce_weight: float = 1.0,
+        grad_cache_microbatch: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.info_nce_temperature = info_nce_temperature
+        self.info_nce_weight = info_nce_weight
+        self.grad_cache_microbatch = grad_cache_microbatch
+
+
+class BD3MGenUnConfig(BD3LMConfig):
+    """Configuration class for BD3MGenUn models."""
+
+    model_type = "bd3m_genun"
+    auto_map = {
+        "AutoConfig": "diffusion.BD3MGenUnConfig",
+        "AutoModel": "diffusion.BD3MGenUn",
+        "AutoModelForMaskedLM": "diffusion.BD3MGenUn",
+    }
+
+    def __init__(
+        self,
+        info_nce_temperature: float = 0.07,
+        info_nce_weight: float = 1.0,
+        gen_weight: float = 1.0,
+        grad_cache_microbatch: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.info_nce_temperature = info_nce_temperature
+        self.info_nce_weight = info_nce_weight
+        self.gen_weight = gen_weight
+        self.grad_cache_microbatch = grad_cache_microbatch
+
+
 class BD3LM(MDLM):
     """Denoiser class for BD3LM models."""
 
@@ -1026,6 +1074,435 @@ class BD3LM(MDLM):
                 "cache_position": position_ids[0],
                 "position_ids": position_ids,
             },
+        )
+
+
+class _BD3MInfoNCEMixin:
+    def _mean_pool(
+        self, hidden: torch.FloatTensor, attention_mask: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        mask = attention_mask.unsqueeze(-1).expand(hidden.shape).float()
+        summed = (hidden * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return summed / denom
+
+    def _infonce_loss(
+        self,
+        hidden_states: torch.FloatTensor,
+        attention_mask: torch.FloatTensor,
+        original_length: int,
+    ) -> torch.FloatTensor:
+        x0_hidden = hidden_states[:, :original_length]
+        xt_hidden = hidden_states[:, original_length : original_length * 2]
+        q = self._mean_pool(xt_hidden, attention_mask)
+        p = self._mean_pool(x0_hidden, attention_mask)
+        logits = (q @ p.transpose(0, 1)) / self.config.info_nce_temperature
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        return torch.nn.functional.cross_entropy(logits, labels)
+
+    def _infonce_grad_cache(
+        self,
+        denoiser_inputs: DenoiserInput,
+        pool_mask: torch.FloatTensor,
+        original_length: int,
+        microbatch_size: int,
+        **kwargs,
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        with torch.no_grad():
+            backbone_output = self._backbone_forward(
+                denoiser_inputs,
+                output_hidden_states=True,
+                return_dict=True,
+                **kwargs,
+            )
+            hidden_states = backbone_output.hidden_states[-1]
+            x0_hidden = hidden_states[:, :original_length]
+            xt_hidden = hidden_states[:, original_length : original_length * 2]
+            q = self._mean_pool(xt_hidden, pool_mask)
+            p = self._mean_pool(x0_hidden, pool_mask)
+        with torch.enable_grad():
+            q_detached = q.detach().requires_grad_(True)
+            p_detached = p.detach().requires_grad_(True)
+            logits = (
+                q_detached @ p_detached.transpose(0, 1)
+            ) / self.config.info_nce_temperature
+            labels = torch.arange(logits.shape[0], device=logits.device)
+            info_nce = torch.nn.functional.cross_entropy(logits, labels)
+            loss_value = info_nce * self.config.info_nce_weight
+            grad_q, grad_p = torch.autograd.grad(
+                loss_value, [q_detached, p_detached]
+            )
+
+        surrogate = torch.zeros((), device=denoiser_inputs.xt.device)
+        batch_size = denoiser_inputs.xt.shape[0]
+        for start in range(0, batch_size, microbatch_size):
+            end = min(start + microbatch_size, batch_size)
+            mb_inputs = DenoiserInput(
+                xt=denoiser_inputs.xt[start:end],
+                x0=(
+                    denoiser_inputs.x0[start:end]
+                    if denoiser_inputs.x0 is not None
+                    else None
+                ),
+                attention_mask=(
+                    denoiser_inputs.attention_mask[start:end]
+                    if denoiser_inputs.attention_mask is not None
+                    else None
+                ),
+                past_key_values=denoiser_inputs.past_key_values,
+                context_mask=denoiser_inputs.context_mask[start:end]
+                if denoiser_inputs.context_mask is not None
+                else None,
+                tokens_mask=denoiser_inputs.tokens_mask[start:end]
+                if denoiser_inputs.tokens_mask is not None
+                else None,
+                t=(
+                    denoiser_inputs.t[start:end]
+                    if denoiser_inputs.t is not None
+                    else None
+                ),
+                alpha_t=denoiser_inputs.alpha_t[start:end]
+                if denoiser_inputs.alpha_t is not None
+                else None,
+                alpha_t_prime=denoiser_inputs.alpha_t_prime[start:end]
+                if denoiser_inputs.alpha_t_prime is not None
+                else None,
+                backbone_kwargs=denoiser_inputs.backbone_kwargs,
+            )
+            mb_output = self._backbone_forward(
+                mb_inputs,
+                output_hidden_states=True,
+                return_dict=True,
+                **kwargs,
+            )
+            mb_hidden = mb_output.hidden_states[-1]
+            mb_x0_hidden = mb_hidden[:, :original_length]
+            mb_xt_hidden = mb_hidden[:, original_length : original_length * 2]
+            mb_pool_mask = pool_mask[start:end]
+            q_mb = self._mean_pool(mb_xt_hidden, mb_pool_mask)
+            p_mb = self._mean_pool(mb_x0_hidden, mb_pool_mask)
+            grad_q_mb = grad_q[start:end].detach()
+            grad_p_mb = grad_p[start:end].detach()
+            surrogate = surrogate + (q_mb * grad_q_mb).sum() + (p_mb * grad_p_mb).sum()
+
+        return info_nce, loss_value.detach(), surrogate
+
+
+class BD3MInfoNCE(_BD3MInfoNCEMixin, BD3LM):
+    """BD3LM variant trained with InfoNCE using masked-input queries."""
+
+    config_class = BD3MInfoNCEConfig
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        context_mask: Optional[torch.FloatTensor] = None,
+        t: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        compute_loss: Optional[bool] = True,
+        **kwargs,
+    ) -> DenoiserOutput:
+        denoiser_inputs = self._prepare_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            context_mask=context_mask,
+            past_key_values=past_key_values,
+            t=t,
+        )
+        backbone_output = self._backbone_forward(
+            denoiser_inputs,
+            output_hidden_states=True,
+            return_dict=True,
+            **kwargs,
+        )
+        hidden_states = backbone_output.hidden_states[-1]
+        logits = getattr(backbone_output, "logits", backbone_output[0])
+        with torch.amp.autocast(input_ids.device.type, dtype=torch.float32):
+            denoiser_output = self._forward(
+                logits,
+                denoiser_inputs,
+                **kwargs,
+            )
+
+        if compute_loss:
+            pool_mask = (
+                attention_mask
+                if attention_mask is not None
+                else torch.ones_like(input_ids)
+            )
+            info_nce = self._infonce_loss(
+                hidden_states=hidden_states,
+                attention_mask=pool_mask,
+                original_length=input_ids.shape[1],
+            )
+            loss = info_nce * self.config.info_nce_weight
+            if self.training:
+                nlls = torch.zeros_like(input_ids, dtype=torch.float)
+            else:
+                with torch.no_grad():
+                    gen_loss_and_nll = super()._compute_loss(
+                        model_output=denoiser_output,
+                        denoiser_inputs=denoiser_inputs,
+                    )
+                nlls = gen_loss_and_nll.nlls
+            other_loss_terms = {"info_nce": info_nce.detach()}
+        else:
+            loss, nlls = None, None
+            other_loss_terms = {}
+
+        return DenoiserOutput(
+            denoiser_output=denoiser_output,
+            logits=logits,
+            past_key_values=getattr(backbone_output, "past_key_values", None),
+            tokens_mask=denoiser_inputs.tokens_mask,
+            loss=loss,
+            nlls=nlls,
+            other_loss_terms=other_loss_terms,
+            info_nce=info_nce if compute_loss else None,
+        )
+
+
+class BD3MInfoNCEGC(_BD3MInfoNCEMixin, BD3LM):
+    """BD3MInfoNCE with gradient cache for large-batch InfoNCE."""
+
+    config_class = BD3MInfoNCEConfig
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        context_mask: Optional[torch.FloatTensor] = None,
+        t: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        compute_loss: Optional[bool] = True,
+        **kwargs,
+    ) -> DenoiserOutput:
+        denoiser_inputs = self._prepare_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            context_mask=context_mask,
+            past_key_values=past_key_values,
+            t=t,
+        )
+
+        pool_mask = (
+            attention_mask if attention_mask is not None else torch.ones_like(input_ids)
+        )
+        info_nce = None
+        loss_value = None
+        loss = None
+        if compute_loss:
+            microbatch_size = getattr(self.config, "grad_cache_microbatch", None)
+            if microbatch_size is None or microbatch_size <= 0:
+                raise ValueError(
+                    "grad_cache_microbatch must be set for BD3MInfoNCEGC."
+                )
+            info_nce, loss_value, surrogate = self._infonce_grad_cache(
+                denoiser_inputs=denoiser_inputs,
+                pool_mask=pool_mask,
+                original_length=input_ids.shape[1],
+                microbatch_size=microbatch_size,
+                **kwargs,
+            )
+            loss = loss_value + (surrogate - surrogate.detach())
+
+        with torch.no_grad():
+            backbone_output = self._backbone_forward(
+                denoiser_inputs,
+                output_hidden_states=False,
+                return_dict=True,
+                **kwargs,
+            )
+            logits = getattr(backbone_output, "logits", backbone_output[0])
+            denoiser_output = self._forward(
+                logits,
+                denoiser_inputs,
+                **kwargs,
+            )
+
+        if compute_loss and not self.training:
+            with torch.no_grad():
+                gen_loss_and_nll = super()._compute_loss(
+                    model_output=denoiser_output,
+                    denoiser_inputs=denoiser_inputs,
+                )
+            nlls = gen_loss_and_nll.nlls
+        elif compute_loss:
+            nlls = torch.zeros_like(input_ids, dtype=torch.float)
+        else:
+            nlls = None
+
+        return DenoiserOutput(
+            denoiser_output=denoiser_output,
+            logits=logits,
+            past_key_values=getattr(backbone_output, "past_key_values", None),
+            tokens_mask=denoiser_inputs.tokens_mask,
+            loss=loss,
+            nlls=nlls,
+            other_loss_terms={"info_nce": info_nce.detach()} if compute_loss else {},
+            info_nce=info_nce if compute_loss else None,
+        )
+
+
+class BD3MGenUn(_BD3MInfoNCEMixin, BD3LM):
+    """BD3LM variant trained with both generative loss and InfoNCE."""
+
+    config_class = BD3MGenUnConfig
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        context_mask: Optional[torch.FloatTensor] = None,
+        t: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        compute_loss: Optional[bool] = True,
+        **kwargs,
+    ) -> DenoiserOutput:
+        denoiser_inputs = self._prepare_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            context_mask=context_mask,
+            past_key_values=past_key_values,
+            t=t,
+        )
+        backbone_output = self._backbone_forward(
+            denoiser_inputs,
+            output_hidden_states=True,
+            return_dict=True,
+            **kwargs,
+        )
+        hidden_states = backbone_output.hidden_states[-1]
+        logits = getattr(backbone_output, "logits", backbone_output[0])
+        with torch.amp.autocast(input_ids.device.type, dtype=torch.float32):
+            denoiser_output = self._forward(
+                logits,
+                denoiser_inputs,
+                **kwargs,
+            )
+
+        gen_loss = None
+        if compute_loss:
+            gen_loss_and_nll = super()._compute_loss(
+                model_output=denoiser_output, denoiser_inputs=denoiser_inputs
+            )
+            gen_loss = gen_loss_and_nll.loss
+            pool_mask = (
+                attention_mask
+                if attention_mask is not None
+                else torch.ones_like(input_ids)
+            )
+            info_nce = self._infonce_loss(
+                hidden_states=hidden_states,
+                attention_mask=pool_mask,
+                original_length=input_ids.shape[1],
+            )
+            loss = (
+                gen_loss * self.config.gen_weight
+                + info_nce * self.config.info_nce_weight
+            )
+            nlls = gen_loss_and_nll.nlls
+            other_loss_terms = {
+                "gen_loss": gen_loss.detach(),
+                "info_nce": info_nce.detach(),
+            }
+        else:
+            loss, nlls = None, None
+            other_loss_terms = {}
+
+        return DenoiserOutput(
+            denoiser_output=denoiser_output,
+            logits=logits,
+            past_key_values=getattr(backbone_output, "past_key_values", None),
+            tokens_mask=denoiser_inputs.tokens_mask,
+            loss=loss,
+            nlls=nlls,
+            other_loss_terms=other_loss_terms,
+            info_nce=info_nce if compute_loss else None,
+            gen_loss=gen_loss.detach() if compute_loss and gen_loss is not None else None,
+        )
+
+
+class BD3MGenUnGC(_BD3MInfoNCEMixin, BD3LM):
+    """BD3MGenUn with gradient cache for large-batch InfoNCE."""
+
+    config_class = BD3MGenUnConfig
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        context_mask: Optional[torch.FloatTensor] = None,
+        t: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        compute_loss: Optional[bool] = True,
+        **kwargs,
+    ) -> DenoiserOutput:
+        denoiser_inputs = self._prepare_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            context_mask=context_mask,
+            past_key_values=past_key_values,
+            t=t,
+        )
+        pool_mask = (
+            attention_mask if attention_mask is not None else torch.ones_like(input_ids)
+        )
+
+        backbone_output = self._backbone_forward(
+            denoiser_inputs,
+            output_hidden_states=False,
+            return_dict=True,
+            **kwargs,
+        )
+        logits = getattr(backbone_output, "logits", backbone_output[0])
+        with torch.amp.autocast(input_ids.device.type, dtype=torch.float32):
+            denoiser_output = self._forward(
+                logits,
+                denoiser_inputs,
+                **kwargs,
+            )
+
+        loss = None
+        nlls = None
+        other_loss_terms: dict[str, torch.FloatTensor] = {}
+        info_nce = None
+        gen_loss = None
+        if compute_loss:
+            gen_loss_and_nll = super()._compute_loss(
+                model_output=denoiser_output, denoiser_inputs=denoiser_inputs
+            )
+            gen_loss = gen_loss_and_nll.loss
+            nlls = gen_loss_and_nll.nlls
+            other_loss_terms["gen_loss"] = gen_loss.detach()
+
+            microbatch_size = getattr(self.config, "grad_cache_microbatch", None)
+            if microbatch_size is None or microbatch_size <= 0:
+                raise ValueError(
+                    "grad_cache_microbatch must be set for BD3MGenUnGC."
+                )
+            info_nce, info_nce_loss_value, surrogate = self._infonce_grad_cache(
+                denoiser_inputs=denoiser_inputs,
+                pool_mask=pool_mask,
+                original_length=input_ids.shape[1],
+                microbatch_size=microbatch_size,
+                **kwargs,
+            )
+            other_loss_terms["info_nce"] = info_nce.detach()
+            info_nce_loss = info_nce_loss_value + (surrogate - surrogate.detach())
+            loss = gen_loss * self.config.gen_weight + info_nce_loss
+
+        return DenoiserOutput(
+            denoiser_output=denoiser_output,
+            logits=logits,
+            past_key_values=getattr(backbone_output, "past_key_values", None),
+            tokens_mask=denoiser_inputs.tokens_mask,
+            loss=loss,
+            nlls=nlls,
+            other_loss_terms=other_loss_terms,
+            info_nce=info_nce if compute_loss else None,
+            gen_loss=gen_loss.detach() if compute_loss and gen_loss is not None else None,
         )
 
     def _prepare_inputs_inference(

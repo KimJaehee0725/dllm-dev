@@ -1,0 +1,16 @@
+defaults:
+  - bd3m_genun@_here_
+  - _self_
+
+_target_: src.denoiser.diffusion.BD3MGenUnGC
+config:
+  _target_: src.denoiser.diffusion.BD3MGenUnConfig
+  block_size: ${block_size}
+  bidirectional_ctx_attn: True
+  info_nce_temperature: 0.07
+  info_nce_weight: 1.0
+  gen_weight: 1.0
+  # Default to train microbatch size; override for larger target batches.
+  # Example: target global batch=1024 with grad_cache_microbatch=128
+  # (forward/backward runs in 8 microbatches but sim matrix uses full batch)
+  grad_cache_microbatch: ${composer.trainer.device_train_microbatch_size}

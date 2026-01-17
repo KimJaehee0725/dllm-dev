@@ -1,0 +1,4 @@
+info_nce:
+  _target_: src.tasks.metrics.Loss
+  name: "loss/info_nce"
+  update_key: info_nce

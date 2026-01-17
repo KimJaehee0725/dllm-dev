@@ -1,0 +1,14 @@
+defaults:
+  - bd3lm@_here_
+  - /metrics@metrics: [loss, gen_loss, info_nce]
+  - /metrics@eval_metrics: [loss, nll, perplexity]
+  - _self_
+
+_target_: src.denoiser.diffusion.BD3MGenUn
+config:
+  _target_: src.denoiser.diffusion.BD3MGenUnConfig
+  block_size: ${block_size}
+  bidirectional_ctx_attn: True
+  info_nce_temperature: 0.07
+  info_nce_weight: 1.0
+  gen_weight: 1.0
